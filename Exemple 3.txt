@@ -1,0 +1,1908 @@
+﻿Oui — cette fois on génère un **vrai mini morceau**.
+
+
+L’idée : un **loop synthwave de 8 mesures** avec :
+
+
+* kick / snare / hi-hat,
+* basse,
+* accords pad,
+* lead mélodique,
+* delay ping-pong,
+* petit master saturé.
+
+
+Le programme écrit un fichier `music_demo.wav`.
+
+
+### `Cargo.toml`
+
+
+```toml
+[package]
+name = "burn_music_demo"
+version = "0.1.0"
+edition = "2021"
+
+
+[dependencies]
+burn = "0.20.1"
+burn-ndarray = "0.20.1"
+hound = "3.5.1"
+```
+
+
+### `src/main.rs`
+
+
+```rust
+use burn::{
+    prelude::s,
+    tensor::{Int, Tensor, TensorData},
+};
+use burn_ndarray::{NdArray, NdArrayDevice};
+use std::{error::Error, f32::consts::PI};
+
+
+/// ---------------------------------------------------------------------------
+/// BACKEND BURN
+/// ---------------------------------------------------------------------------
+/// On reste en CPU pour garder l'exemple simple.
+/// Le plus important ici, c'est la logique musicale.
+///
+/// Plus tard, tu pourras remplacer le backend par WGPU
+/// sans changer toute l'architecture du morceau.
+/// ---------------------------------------------------------------------------
+type B = NdArray<f32>;
+type Device = NdArrayDevice;
+
+
+/// ---------------------------------------------------------------------------
+/// OUTILS TENSOR / AUDIO DE BASE
+/// ---------------------------------------------------------------------------
+
+
+fn tensor_from_samples(samples: &[f32], device: &Device) -> Tensor<B, 1> {
+    Tensor::<B, 1>::from_data(TensorData::new(samples.to_vec(), [samples.len()]), device)
+}
+
+
+fn tensor_to_samples(x: Tensor<B, 1>) -> Vec<f32> {
+    x.into_data().to_vec::<f32>().unwrap()
+}
+
+
+/// Axe du temps: t = [0, 1/sr, 2/sr, ...]
+fn time_axis(n: usize, sample_rate: usize, device: &Device) -> Tensor<B, 1> {
+    Tensor::<B, 1, Int>::arange(0..n as i64, device)
+        .float()
+        .div_scalar(sample_rate as f32)
+}
+
+
+/// Sinusoïde pure.
+fn sine_wave(freq_hz: f32, seconds: f32, sample_rate: usize, device: &Device) -> Tensor<B, 1> {
+    let n = (seconds * sample_rate as f32) as usize;
+    let t = time_axis(n, sample_rate, device);
+    t.mul_scalar(2.0 * PI * freq_hz).sin()
+}
+
+
+/// Saw additive:
+/// somme des harmoniques 1/k.
+/// Ce n'est pas band-limited, mais pour une démo offline c'est parfait.
+fn saw_wave(freq_hz: f32, seconds: f32, sample_rate: usize, device: &Device) -> Tensor<B, 1> {
+    let n = (seconds * sample_rate as f32) as usize;
+    let t = time_axis(n, sample_rate, device);
+
+
+    let mut out = Tensor::<B, 1>::zeros([n], device);
+
+
+    for k in 1..=12 {
+        let harmonic = t
+            .clone()
+            .mul_scalar(2.0 * PI * freq_hz * k as f32)
+            .sin()
+            .div_scalar(k as f32);
+
+
+        out = out + harmonic;
+    }
+
+
+    out
+}
+
+
+/// Onde "square-ish" via harmoniques impaires.
+/// Très utile pour une basse rétro.
+fn squareish_wave(freq_hz: f32, seconds: f32, sample_rate: usize, device: &Device) -> Tensor<B, 1> {
+    let n = (seconds * sample_rate as f32) as usize;
+    let t = time_axis(n, sample_rate, device);
+
+
+    let mut out = Tensor::<B, 1>::zeros([n], device);
+
+
+    for k in [1, 3, 5, 7, 9] {
+        let harmonic = t
+            .clone()
+            .mul_scalar(2.0 * PI * freq_hz * k as f32)
+            .sin()
+            .div_scalar(k as f32);
+
+
+        out = out + harmonic;
+    }
+
+
+    out
+}
+
+
+/// Saturation douce.
+/// C'est l'un des moyens les plus simples de donner un côté "musical"
+/// et moins stérile à un signal.
+fn soft_clip_tanh(x: Tensor<B, 1>, drive: f32) -> Tensor<B, 1> {
+    x.mul_scalar(drive).tanh()
+}
+
+
+/// Petit low-pass super simple.
+/// Ici: moyenne glissante symétrique.
+/// Pas ultra fidèle, mais très pratique pour adoucir un son.
+fn low_pass_moving_average(x: Tensor<B, 1>, radius: usize) -> Tensor<B, 1> {
+    let n = x.dims()[0];
+    let device = x.device();
+
+
+    let mut acc = Tensor::<B, 1>::zeros([n], &device);
+    let mut taps = 0usize;
+
+
+    acc = acc + x.clone();
+    taps += 1;
+
+
+    for k in 1..=radius {
+        acc = acc + shift_right_zero(x.clone(), k);
+        acc = acc + shift_left_zero(x.clone(), k);
+        taps += 2;
+    }
+
+
+    acc.div_scalar(taps as f32)
+}
+
+
+/// High-pass approximatif = original - low-pass.
+/// Super utile pour sculpter bruit de caisse claire / charley.
+fn high_pass_from_lowpass(x: Tensor<B, 1>, radius: usize) -> Tensor<B, 1> {
+    let low = low_pass_moving_average(x.clone(), radius);
+    x - low
+}
+
+
+fn normalize_peak_mono(x: Tensor<B, 1>, target_peak: f32) -> Tensor<B, 1> {
+    let peak = x.clone().abs().max().into_scalar();
+
+
+    if peak < 1e-8 {
+        x
+    } else {
+        x.div_scalar(peak).mul_scalar(target_peak)
+    }
+}
+
+
+fn shift_right_zero(x: Tensor<B, 1>, shift: usize) -> Tensor<B, 1> {
+    let n = x.dims()[0];
+    let device = x.device();
+
+
+    if shift == 0 {
+        return x;
+    }
+    if shift >= n {
+        return Tensor::<B, 1>::zeros([n], &device);
+    }
+
+
+    let core = x.slice(s![..(n - shift)]);
+    let mut out = Tensor::<B, 1>::zeros([n], &device);
+    out = out.slice_assign(s![(shift)..], core);
+    out
+}
+
+
+fn shift_left_zero(x: Tensor<B, 1>, shift: usize) -> Tensor<B, 1> {
+    let n = x.dims()[0];
+    let device = x.device();
+
+
+    if shift == 0 {
+        return x;
+    }
+    if shift >= n {
+        return Tensor::<B, 1>::zeros([n], &device);
+    }
+
+
+    let core = x.slice(s![(shift)..]);
+    let mut out = Tensor::<B, 1>::zeros([n], &device);
+    out = out.slice_assign(s![..(n - shift)], core);
+    out
+}
+
+
+/// ---------------------------------------------------------------------------
+/// OUTILS MUSICAUX
+/// ---------------------------------------------------------------------------
+
+
+fn beats_to_seconds(beats: f32, bpm: f32) -> f32 {
+    beats * 60.0 / bpm
+}
+
+
+fn beat_to_sample(beat: f32, bpm: f32, sample_rate: usize) -> usize {
+    (beats_to_seconds(beat, bpm) * sample_rate as f32) as usize
+}
+
+
+/// Conversion MIDI -> fréquence.
+fn midi_to_hz(midi: i32) -> f32 {
+    440.0 * 2.0_f32.powf((midi as f32 - 69.0) / 12.0)
+}
+
+
+/// ADSR simple calculée côté Rust.
+/// On pourrait aussi la faire en pur tenseur, mais ici l'objectif
+/// est surtout de garder le code pédagogique.
+fn adsr_envelope(
+    n: usize,
+    sample_rate: usize,
+    attack_s: f32,
+    decay_s: f32,
+    sustain_level: f32,
+    release_s: f32,
+) -> Vec<f32> {
+    let attack_n = (attack_s * sample_rate as f32) as usize;
+    let decay_n = (decay_s * sample_rate as f32) as usize;
+    let release_n = (release_s * sample_rate as f32) as usize;
+
+
+    let sustain_start = attack_n + decay_n;
+    let release_start = n.saturating_sub(release_n);
+
+
+    let mut env = vec![0.0; n];
+
+
+    for i in 0..n {
+        env[i] = if attack_n > 0 && i < attack_n {
+            i as f32 / attack_n as f32
+        } else if decay_n > 0 && i < sustain_start {
+            let t = (i - attack_n) as f32 / decay_n as f32;
+            1.0 + (sustain_level - 1.0) * t
+        } else if i < release_start {
+            sustain_level
+        } else if release_n > 0 {
+            let t = (i - release_start) as f32 / release_n as f32;
+            sustain_level * (1.0 - t).max(0.0)
+        } else {
+            0.0
+        };
+    }
+
+
+    env
+}
+
+
+/// Petit générateur de bruit pseudo-aléatoire.
+/// Pratique pour snare et hi-hat.
+fn noise_vec(n: usize, seed: u32) -> Vec<f32> {
+    let mut state = seed;
+    let mut out = Vec::with_capacity(n);
+
+
+    for _ in 0..n {
+        state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+        let v = ((state >> 8) as f32 / ((u32::MAX >> 8) as f32)) * 2.0 - 1.0;
+        out.push(v);
+    }
+
+
+    out
+}
+
+
+/// ---------------------------------------------------------------------------
+/// SYNTHÉS DE NOTES
+/// ---------------------------------------------------------------------------
+
+
+/// Note de basse:
+/// - square-ish pour le corps
+/// - sinus à l'octave du dessous pour le sub
+/// - enveloppe courte
+/// - léger low-pass
+/// - saturation
+fn render_bass_note(midi: i32, beats: f32, bpm: f32, sample_rate: usize, device: &Device) -> Vec<f32> {
+    let seconds = beats_to_seconds(beats, bpm);
+    let n = (seconds * sample_rate as f32) as usize;
+    let freq = midi_to_hz(midi);
+
+
+    let osc_main = squareish_wave(freq, seconds, sample_rate, device).mul_scalar(0.75);
+    let osc_sub = sine_wave(freq / 2.0, seconds, sample_rate, device).mul_scalar(0.45);
+
+
+    let env = adsr_envelope(n, sample_rate, 0.003, 0.08, 0.55, 0.08);
+    let env_t = tensor_from_samples(&env, device);
+
+
+    let x = (osc_main + osc_sub) * env_t;
+    let x = low_pass_moving_average(x, 4);
+    let x = soft_clip_tanh(x, 1.8);
+    let x = normalize_peak_mono(x, 0.85);
+
+
+    tensor_to_samples(x)
+}
+
+
+/// Note de pad:
+/// - double saw détunée
+/// - enveloppe lente
+/// - filtre doux
+/// - saturation légère
+fn render_pad_note(midi: i32, beats: f32, bpm: f32, sample_rate: usize, device: &Device) -> Vec<f32> {
+    let seconds = beats_to_seconds(beats, bpm);
+    let n = (seconds * sample_rate as f32) as usize;
+    let freq = midi_to_hz(midi);
+
+
+    let saw_a = saw_wave(freq * 0.997, seconds, sample_rate, device).mul_scalar(0.50);
+    let saw_b = saw_wave(freq * 1.003, seconds, sample_rate, device).mul_scalar(0.50);
+    let body = sine_wave(freq / 2.0, seconds, sample_rate, device).mul_scalar(0.20);
+
+
+    let env = adsr_envelope(n, sample_rate, 0.25, 0.40, 0.75, 0.80);
+    let env_t = tensor_from_samples(&env, device);
+
+
+    let x = (saw_a + saw_b + body) * env_t;
+    let x = low_pass_moving_average(x, 8);
+    let x = soft_clip_tanh(x, 1.3);
+    let x = normalize_peak_mono(x, 0.75);
+
+
+    tensor_to_samples(x)
+}
+
+
+/// Note de lead:
+/// - saw pour le mordant
+/// - sinus pour arrondir
+/// - enveloppe plus nerveuse
+/// - saturation un peu plus forte
+fn render_lead_note(midi: i32, beats: f32, bpm: f32, sample_rate: usize, device: &Device) -> Vec<f32> {
+    let seconds = beats_to_seconds(beats, bpm);
+    let n = (seconds * sample_rate as f32) as usize;
+    let freq = midi_to_hz(midi);
+
+
+    let saw = saw_wave(freq, seconds, sample_rate, device).mul_scalar(0.70);
+    let sine = sine_wave(freq, seconds, sample_rate, device).mul_scalar(0.25);
+    let air = sine_wave(freq * 2.0, seconds, sample_rate, device).mul_scalar(0.10);
+
+
+    let env = adsr_envelope(n, sample_rate, 0.005, 0.06, 0.55, 0.12);
+    let env_t = tensor_from_samples(&env, device);
+
+
+    let x = (saw + sine + air) * env_t;
+    let x = low_pass_moving_average(x, 2);
+    let x = soft_clip_tanh(x, 2.0);
+    let x = normalize_peak_mono(x, 0.80);
+
+
+    tensor_to_samples(x)
+}
+
+
+/// Kick synthétique:
+/// - fréquence qui descend vite
+/// - enveloppe courte
+/// - petit click d'attaque
+fn render_kick(sample_rate: usize, device: &Device) -> Vec<f32> {
+    let seconds = 0.50;
+    let n = (seconds * sample_rate as f32) as usize;
+
+
+    let mut out = vec![0.0; n];
+    let mut phase = 0.0f32;
+
+
+    for i in 0..n {
+        let t = i as f32 / sample_rate as f32;
+        let x = i as f32 / n as f32;
+
+
+        let freq = 150.0 - 110.0 * x.powf(0.35);
+        phase += 2.0 * PI * freq / sample_rate as f32;
+
+
+        let amp = (1.0 - x).powf(4.0);
+
+
+        let click = if t < 0.008 {
+            (1.0 - t / 0.008).powf(5.0) * 0.25
+        } else {
+            0.0
+        };
+
+
+        out[i] = phase.sin() * amp + click;
+    }
+
+
+    let x = tensor_from_samples(&out, device);
+    let x = soft_clip_tanh(x, 1.6);
+    let x = normalize_peak_mono(x, 0.95);
+
+
+    tensor_to_samples(x)
+}
+
+
+/// Snare:
+/// - bruit bright
+/// - un petit fond tonal
+/// - enveloppe rapide
+fn render_snare(sample_rate: usize, device: &Device) -> Vec<f32> {
+    let seconds = 0.28;
+    let n = (seconds * sample_rate as f32) as usize;
+
+
+    let noise = noise_vec(n, 0x12345678);
+    let noise_t = tensor_from_samples(&noise, device);
+    let bright = high_pass_from_lowpass(noise_t, 20).mul_scalar(0.95);
+
+
+    let tone = sine_wave(180.0, seconds, sample_rate, device).mul_scalar(0.20);
+
+
+    let env = adsr_envelope(n, sample_rate, 0.001, 0.05, 0.18, 0.10);
+    let env_t = tensor_from_samples(&env, device);
+
+
+    let x = (bright + tone) * env_t;
+    let x = soft_clip_tanh(x, 1.5);
+    let x = normalize_peak_mono(x, 0.80);
+
+
+    tensor_to_samples(x)
+}
+
+
+/// Hi-hat:
+/// - bruit très aigu
+/// - enveloppe ultra courte
+fn render_hat(sample_rate: usize, device: &Device, seed: u32) -> Vec<f32> {
+    let seconds = 0.08;
+    let n = (seconds * sample_rate as f32) as usize;
+
+
+    let noise = noise_vec(n, seed);
+    let noise_t = tensor_from_samples(&noise, device);
+    let bright = high_pass_from_lowpass(noise_t, 8);
+
+
+    let env = adsr_envelope(n, sample_rate, 0.0005, 0.01, 0.08, 0.03);
+    let env_t = tensor_from_samples(&env, device);
+
+
+    let x = bright * env_t;
+    let x = soft_clip_tanh(x, 1.2);
+    let x = normalize_peak_mono(x, 0.40);
+
+
+    tensor_to_samples(x)
+}
+
+
+/// ---------------------------------------------------------------------------
+/// MIX / STÉRÉO
+/// ---------------------------------------------------------------------------
+
+
+fn pan_gains(pan: f32) -> (f32, f32) {
+    let p = pan.clamp(-1.0, 1.0);
+    let angle = (p + 1.0) * PI * 0.25;
+    (angle.cos(), angle.sin())
+}
+
+
+/// Ajoute un clip mono dans une piste stéréo à une position donnée.
+/// `pan = -1` => gauche, `pan = +1` => droite.
+fn add_clip_stereo(
+    left: &mut [f32],
+    right: &mut [f32],
+    start_sample: usize,
+    clip: &[f32],
+    gain: f32,
+    pan: f32,
+) {
+    let (gl, gr) = pan_gains(pan);
+
+
+    for (i, &x) in clip.iter().enumerate() {
+        let pos = start_sample + i;
+        if pos >= left.len() {
+            break;
+        }
+
+
+        left[pos] += x * gain * gl;
+        right[pos] += x * gain * gr;
+    }
+}
+
+
+/// Delay ping-pong très simple sur une piste stéréo.
+/// On prend le centre et on envoie les répétitions alternativement
+/// à gauche puis à droite.
+fn ping_pong_delay(
+    left: &[f32],
+    right: &[f32],
+    sample_rate: usize,
+    delay_ms: usize,
+    taps: usize,
+    decay: f32,
+    send: f32,
+) -> (Vec<f32>, Vec<f32>) {
+    let n = left.len();
+    let mut out_l = left.to_vec();
+    let mut out_r = right.to_vec();
+
+
+    let center: Vec<f32> = left
+        .iter()
+        .zip(right.iter())
+        .map(|(l, r)| (l + r) * 0.5 * send)
+        .collect();
+
+
+    let delay = sample_rate * delay_ms / 1000;
+
+
+    for tap in 1..=taps {
+        let shift = tap * delay;
+        let gain = decay.powi(tap as i32);
+
+
+        for i in 0..n {
+            let dst = i + shift;
+            if dst >= n {
+                break;
+            }
+
+
+            let x = center[i] * gain;
+
+
+            if tap % 2 == 1 {
+                out_l[dst] += x;
+            } else {
+                out_r[dst] += x;
+            }
+        }
+    }
+
+
+    (out_l, out_r)
+}
+
+
+/// Master final:
+/// - saturation légère
+/// - un tout petit adoucissement
+/// - normalisation
+fn master_stereo(left: Vec<f32>, right: Vec<f32>, device: &Device) -> (Vec<f32>, Vec<f32>) {
+    let l = tensor_from_samples(&left, device);
+    let r = tensor_from_samples(&right, device);
+
+
+    let l = soft_clip_tanh(l, 1.25);
+    let r = soft_clip_tanh(r, 1.25);
+
+
+    let l = low_pass_moving_average(l, 1);
+    let r = low_pass_moving_average(r, 1);
+
+
+    let l_peak = l.clone().abs().max().into_scalar();
+    let r_peak = r.clone().abs().max().into_scalar();
+    let peak = l_peak.max(r_peak).max(1e-6);
+
+
+    let l = l.div_scalar(peak).mul_scalar(0.95);
+    let r = r.div_scalar(peak).mul_scalar(0.95);
+
+
+    (tensor_to_samples(l), tensor_to_samples(r))
+}
+
+
+/// ---------------------------------------------------------------------------
+/// EXPORT WAV
+/// ---------------------------------------------------------------------------
+
+
+fn write_wav_stereo_f32(
+    path: &str,
+    left: &[f32],
+    right: &[f32],
+    sample_rate: u32,
+) -> Result<(), Box<dyn Error>> {
+    if left.len() != right.len() {
+        return Err("Les deux canaux n'ont pas la même taille.".into());
+    }
+
+
+    let spec = hound::WavSpec {
+        channels: 2,
+        sample_rate,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+
+
+    let mut writer = hound::WavWriter::create(path, spec)?;
+
+
+    for i in 0..left.len() {
+        let l = left[i].clamp(-1.0, 1.0);
+        let r = right[i].clamp(-1.0, 1.0);
+
+
+        writer.write_sample((l * i16::MAX as f32) as i16)?;
+        writer.write_sample((r * i16::MAX as f32) as i16)?;
+    }
+
+
+    writer.finalize()?;
+    Ok(())
+}
+
+
+/// ---------------------------------------------------------------------------
+/// GÉNÉRATION DU MORCEAU
+/// ---------------------------------------------------------------------------
+
+
+fn main() -> Result<(), Box<dyn Error>> {
+    let device = Device::default();
+
+
+    // -----------------------------------------------------------------------
+    // PARAMÈTRES GLOBAUX
+    // -----------------------------------------------------------------------
+    let sample_rate = 44_100usize;
+    let bpm = 100.0;
+    let bars = 8usize;
+
+
+    // On ajoute un peu de marge à la fin pour laisser respirer le delay.
+    let total_beats = bars as f32 * 4.0 + 4.0;
+    let total_samples = beat_to_sample(total_beats, bpm, sample_rate);
+
+
+    // Stems séparés pour construire le morceau proprement.
+    let mut drums_l = vec![0.0f32; total_samples];
+    let mut drums_r = vec![0.0f32; total_samples];
+
+
+    let mut bass_l = vec![0.0f32; total_samples];
+    let mut bass_r = vec![0.0f32; total_samples];
+
+
+    let mut pad_l = vec![0.0f32; total_samples];
+    let mut pad_r = vec![0.0f32; total_samples];
+
+
+    let mut lead_l = vec![0.0f32; total_samples];
+    let mut lead_r = vec![0.0f32; total_samples];
+
+
+    // -----------------------------------------------------------------------
+    // SONS DE BATTERIE
+    // -----------------------------------------------------------------------
+    let kick = render_kick(sample_rate, &device);
+    let snare = render_snare(sample_rate, &device);
+
+
+    // -----------------------------------------------------------------------
+    // HARMONIE
+    // -----------------------------------------------------------------------
+    // Progression ultra classique qui sonne immédiatement "musique":
+    // Am - F - C - G
+    //
+    // Chaque entrée:
+    // - accord pad
+    // - racine de basse
+    let progression: [([i32; 3], i32); 4] = [
+        ([57, 60, 64], 33), // A minor : A3 C4 E4 / basse A1
+        ([53, 57, 60], 29), // F major : F3 A3 C4 / basse F1
+        ([60, 64, 67], 36), // C major : C4 E4 G4 / basse C2
+        ([55, 59, 62], 31), // G major : G3 B3 D4 / basse G1
+    ];
+
+
+    // -----------------------------------------------------------------------
+    // PAD + BASSE
+    // -----------------------------------------------------------------------
+    for bar in 0..bars {
+        let (chord, bass_root) = progression[bar % progression.len()];
+        let bar_start_beat = bar as f32 * 4.0;
+
+
+        // --- PAD ---
+        // On place les 3 notes de l'accord dans le champ stéréo.
+        // Gauche / centre / droite.
+        for (note_index, midi) in chord.iter().enumerate() {
+            let pan = match note_index {
+                0 => -0.45,
+                1 => 0.0,
+                _ => 0.45,
+            };
+
+
+            // L'accord tient tout le bar.
+            let clip = render_pad_note(*midi, 4.0, bpm, sample_rate, &device);
+            let start = beat_to_sample(bar_start_beat, bpm, sample_rate);
+            add_clip_stereo(&mut pad_l, &mut pad_r, start, &clip, 0.28, pan);
+        }
+
+
+        // --- BASSE ---
+        // Pattern simple mais efficace:
+        // racine, racine, octave, quinte
+        let bass_pattern = [bass_root, bass_root, bass_root + 12, bass_root + 7];
+
+
+        for step in 0..4 {
+            let clip = render_bass_note(bass_pattern[step], 0.85, bpm, sample_rate, &device);
+            let start = beat_to_sample(bar_start_beat + step as f32, bpm, sample_rate);
+            add_clip_stereo(&mut bass_l, &mut bass_r, start, &clip, 0.32, 0.0);
+        }
+    }
+
+
+    // -----------------------------------------------------------------------
+    // BATTERIE
+    // -----------------------------------------------------------------------
+    for bar in 0..bars {
+        let base = bar as f32 * 4.0;
+
+
+        // Kick en four-on-the-floor:
+        // une grosse caisse sur chaque temps.
+        for beat in [0.0, 1.0, 2.0, 3.0] {
+            let start = beat_to_sample(base + beat, bpm, sample_rate);
+            add_clip_stereo(&mut drums_l, &mut drums_r, start, &kick, 0.55, 0.0);
+        }
+
+
+        // Snare sur 2 et 4.
+        for beat in [1.0, 3.0] {
+            let start = beat_to_sample(base + beat, bpm, sample_rate);
+            add_clip_stereo(&mut drums_l, &mut drums_r, start, &snare, 0.48, 0.0);
+        }
+
+
+        // Hi-hat sur tous les contretemps (croches).
+        for step in 0..8 {
+            let beat = base + step as f32 * 0.5;
+
+
+            let hat = render_hat(sample_rate, &device, 0xABCDEF00u32.wrapping_add((bar * 8 + step) as u32));
+
+
+            // Légère alternance gauche/droite pour donner du mouvement.
+            let pan = if step % 2 == 0 { -0.15 } else { 0.15 };
+
+
+            let start = beat_to_sample(beat, bpm, sample_rate);
+            add_clip_stereo(&mut drums_l, &mut drums_r, start, &hat, 0.22, pan);
+        }
+    }
+
+
+    // -----------------------------------------------------------------------
+    // LEAD MÉLODIQUE
+    // -----------------------------------------------------------------------
+    // On laisse respirer le morceau:
+    // la mélodie n'entre qu'à partir de la mesure 5.
+    //
+    // Motifs simples en A mineur.
+    let motif_a: &[(f32, i32, f32)] = &[
+        (0.0, 69, 0.5),  // A4
+        (0.5, 72, 0.5),  // C5
+        (1.0, 76, 0.75), // E5
+        (2.0, 74, 0.5),  // D5
+        (2.5, 72, 0.5),  // C5
+        (3.0, 69, 0.75), // A4
+    ];
+
+
+    let motif_b: &[(f32, i32, f32)] = &[
+        (0.0, 72, 0.5),  // C5
+        (0.5, 74, 0.5),  // D5
+        (1.0, 76, 0.5),  // E5
+        (1.5, 79, 0.75), // G5
+        (2.5, 76, 0.5),  // E5
+        (3.0, 74, 0.75), // D5
+    ];
+
+
+    for bar in 4..bars {
+        let bar_start = bar as f32 * 4.0;
+        let motif = if bar % 2 == 0 { motif_a } else { motif_b };
+
+
+        for &(offset, midi, dur) in motif.iter() {
+            let clip = render_lead_note(midi, dur, bpm, sample_rate, &device);
+            let start = beat_to_sample(bar_start + offset, bpm, sample_rate);
+
+
+            // Lead légèrement à droite.
+            add_clip_stereo(&mut lead_l, &mut lead_r, start, &clip, 0.26, 0.10);
+        }
+    }
+
+
+    // Delay ping-pong sur le lead pour le rendre vivant.
+    let (lead_l, lead_r) = ping_pong_delay(
+        &lead_l,
+        &lead_r,
+        sample_rate,
+        220,  // environ une croche à ce BPM
+        6,
+        0.58,
+        0.65,
+    );
+
+
+    // -----------------------------------------------------------------------
+    // MIX FINAL
+    // -----------------------------------------------------------------------
+    let mut mix_l = vec![0.0f32; total_samples];
+    let mut mix_r = vec![0.0f32; total_samples];
+
+
+    for i in 0..total_samples {
+        mix_l[i] =
+            drums_l[i] * 1.00 +
+            bass_l[i]  * 0.95 +
+            pad_l[i]   * 0.90 +
+            lead_l[i]  * 1.00;
+
+
+        mix_r[i] =
+            drums_r[i] * 1.00 +
+            bass_r[i]  * 0.95 +
+            pad_r[i]   * 0.90 +
+            lead_r[i]  * 1.00;
+    }
+
+
+    let (mix_l, mix_r) = master_stereo(mix_l, mix_r, &device);
+
+
+    write_wav_stereo_f32("music_demo.wav", &mix_l, &mix_r, sample_rate as u32)?;
+
+
+    println!("OK: music_demo.wav généré.");
+
+
+    Ok(())
+}
+```
+
+
+### Ce que ce programme fait vraiment
+
+
+Il génère un loop qui ressemble à un mini morceau :
+
+
+* **batterie** régulière,
+* **basse** qui suit les accords,
+* **pads** larges,
+* **lead** qui entre après quelques mesures,
+* **delay ping-pong** pour l’espace,
+* **master** un peu saturé pour éviter le côté trop propre.
+
+
+### Pour lancer
+
+
+```bash
+cargo run --release
+```
+
+
+Puis écoute `music_demo.wav`.
+
+
+### Trois réglages qui changent tout
+
+
+Dans `main()` :
+
+
+* `let bpm = 100.0;` pour la vitesse,
+* la `progression` pour changer l’harmonie,
+* `motif_a` et `motif_b` pour écrire une autre mélodie.
+
+
+Au prochain tour, je te fais une version encore plus musicale avec **intro, montée, refrain, outro** et **stems séparés** (`drums.wav`, `bass.wav`, `pad.wav`, `lead.wav`).
+dOui — cette fois on génère un **vrai mini morceau**.
+
+
+L’idée : un **loop synthwave de 8 mesures** avec :
+
+
+* kick / snare / hi-hat,
+* basse,
+* accords pad,
+* lead mélodique,
+* delay ping-pong,
+* petit master saturé.
+
+
+Le programme écrit un fichier `music_demo.wav`.
+
+
+### `Cargo.toml`
+
+
+```toml
+[package]
+name = "burn_music_demo"
+version = "0.1.0"
+edition = "2021"
+
+
+[dependencies]
+burn = "0.20.1"
+burn-ndarray = "0.20.1"
+hound = "3.5.1"
+```
+
+
+### `src/main.rs`
+
+
+```rust
+use burn::{
+    prelude::s,
+    tensor::{Int, Tensor, TensorData},
+};
+use burn_ndarray::{NdArray, NdArrayDevice};
+use std::{error::Error, f32::consts::PI};
+
+
+/// ---------------------------------------------------------------------------
+/// BACKEND BURN
+/// ---------------------------------------------------------------------------
+/// On reste en CPU pour garder l'exemple simple.
+/// Le plus important ici, c'est la logique musicale.
+///
+/// Plus tard, tu pourras remplacer le backend par WGPU
+/// sans changer toute l'architecture du morceau.
+/// ---------------------------------------------------------------------------
+type B = NdArray<f32>;
+type Device = NdArrayDevice;
+
+
+/// ---------------------------------------------------------------------------
+/// OUTILS TENSOR / AUDIO DE BASE
+/// ---------------------------------------------------------------------------
+
+
+fn tensor_from_samples(samples: &[f32], device: &Device) -> Tensor<B, 1> {
+    Tensor::<B, 1>::from_data(TensorData::new(samples.to_vec(), [samples.len()]), device)
+}
+
+
+fn tensor_to_samples(x: Tensor<B, 1>) -> Vec<f32> {
+    x.into_data().to_vec::<f32>().unwrap()
+}
+
+
+/// Axe du temps: t = [0, 1/sr, 2/sr, ...]
+fn time_axis(n: usize, sample_rate: usize, device: &Device) -> Tensor<B, 1> {
+    Tensor::<B, 1, Int>::arange(0..n as i64, device)
+        .float()
+        .div_scalar(sample_rate as f32)
+}
+
+
+/// Sinusoïde pure.
+fn sine_wave(freq_hz: f32, seconds: f32, sample_rate: usize, device: &Device) -> Tensor<B, 1> {
+    let n = (seconds * sample_rate as f32) as usize;
+    let t = time_axis(n, sample_rate, device);
+    t.mul_scalar(2.0 * PI * freq_hz).sin()
+}
+
+
+/// Saw additive:
+/// somme des harmoniques 1/k.
+/// Ce n'est pas band-limited, mais pour une démo offline c'est parfait.
+fn saw_wave(freq_hz: f32, seconds: f32, sample_rate: usize, device: &Device) -> Tensor<B, 1> {
+    let n = (seconds * sample_rate as f32) as usize;
+    let t = time_axis(n, sample_rate, device);
+
+
+    let mut out = Tensor::<B, 1>::zeros([n], device);
+
+
+    for k in 1..=12 {
+        let harmonic = t
+            .clone()
+            .mul_scalar(2.0 * PI * freq_hz * k as f32)
+            .sin()
+            .div_scalar(k as f32);
+
+
+        out = out + harmonic;
+    }
+
+
+    out
+}
+
+
+/// Onde "square-ish" via harmoniques impaires.
+/// Très utile pour une basse rétro.
+fn squareish_wave(freq_hz: f32, seconds: f32, sample_rate: usize, device: &Device) -> Tensor<B, 1> {
+    let n = (seconds * sample_rate as f32) as usize;
+    let t = time_axis(n, sample_rate, device);
+
+
+    let mut out = Tensor::<B, 1>::zeros([n], device);
+
+
+    for k in [1, 3, 5, 7, 9] {
+        let harmonic = t
+            .clone()
+            .mul_scalar(2.0 * PI * freq_hz * k as f32)
+            .sin()
+            .div_scalar(k as f32);
+
+
+        out = out + harmonic;
+    }
+
+
+    out
+}
+
+
+/// Saturation douce.
+/// C'est l'un des moyens les plus simples de donner un côté "musical"
+/// et moins stérile à un signal.
+fn soft_clip_tanh(x: Tensor<B, 1>, drive: f32) -> Tensor<B, 1> {
+    x.mul_scalar(drive).tanh()
+}
+
+
+/// Petit low-pass super simple.
+/// Ici: moyenne glissante symétrique.
+/// Pas ultra fidèle, mais très pratique pour adoucir un son.
+fn low_pass_moving_average(x: Tensor<B, 1>, radius: usize) -> Tensor<B, 1> {
+    let n = x.dims()[0];
+    let device = x.device();
+
+
+    let mut acc = Tensor::<B, 1>::zeros([n], &device);
+    let mut taps = 0usize;
+
+
+    acc = acc + x.clone();
+    taps += 1;
+
+
+    for k in 1..=radius {
+        acc = acc + shift_right_zero(x.clone(), k);
+        acc = acc + shift_left_zero(x.clone(), k);
+        taps += 2;
+    }
+
+
+    acc.div_scalar(taps as f32)
+}
+
+
+/// High-pass approximatif = original - low-pass.
+/// Super utile pour sculpter bruit de caisse claire / charley.
+fn high_pass_from_lowpass(x: Tensor<B, 1>, radius: usize) -> Tensor<B, 1> {
+    let low = low_pass_moving_average(x.clone(), radius);
+    x - low
+}
+
+
+fn normalize_peak_mono(x: Tensor<B, 1>, target_peak: f32) -> Tensor<B, 1> {
+    let peak = x.clone().abs().max().into_scalar();
+
+
+    if peak < 1e-8 {
+        x
+    } else {
+        x.div_scalar(peak).mul_scalar(target_peak)
+    }
+}
+
+
+fn shift_right_zero(x: Tensor<B, 1>, shift: usize) -> Tensor<B, 1> {
+    let n = x.dims()[0];
+    let device = x.device();
+
+
+    if shift == 0 {
+        return x;
+    }
+    if shift >= n {
+        return Tensor::<B, 1>::zeros([n], &device);
+    }
+
+
+    let core = x.slice(s![..(n - shift)]);
+    let mut out = Tensor::<B, 1>::zeros([n], &device);
+    out = out.slice_assign(s![(shift)..], core);
+    out
+}
+
+
+fn shift_left_zero(x: Tensor<B, 1>, shift: usize) -> Tensor<B, 1> {
+    let n = x.dims()[0];
+    let device = x.device();
+
+
+    if shift == 0 {
+        return x;
+    }
+    if shift >= n {
+        return Tensor::<B, 1>::zeros([n], &device);
+    }
+
+
+    let core = x.slice(s![(shift)..]);
+    let mut out = Tensor::<B, 1>::zeros([n], &device);
+    out = out.slice_assign(s![..(n - shift)], core);
+    out
+}
+
+
+/// ---------------------------------------------------------------------------
+/// OUTILS MUSICAUX
+/// ---------------------------------------------------------------------------
+
+
+fn beats_to_seconds(beats: f32, bpm: f32) -> f32 {
+    beats * 60.0 / bpm
+}
+
+
+fn beat_to_sample(beat: f32, bpm: f32, sample_rate: usize) -> usize {
+    (beats_to_seconds(beat, bpm) * sample_rate as f32) as usize
+}
+
+
+/// Conversion MIDI -> fréquence.
+fn midi_to_hz(midi: i32) -> f32 {
+    440.0 * 2.0_f32.powf((midi as f32 - 69.0) / 12.0)
+}
+
+
+/// ADSR simple calculée côté Rust.
+/// On pourrait aussi la faire en pur tenseur, mais ici l'objectif
+/// est surtout de garder le code pédagogique.
+fn adsr_envelope(
+    n: usize,
+    sample_rate: usize,
+    attack_s: f32,
+    decay_s: f32,
+    sustain_level: f32,
+    release_s: f32,
+) -> Vec<f32> {
+    let attack_n = (attack_s * sample_rate as f32) as usize;
+    let decay_n = (decay_s * sample_rate as f32) as usize;
+    let release_n = (release_s * sample_rate as f32) as usize;
+
+
+    let sustain_start = attack_n + decay_n;
+    let release_start = n.saturating_sub(release_n);
+
+
+    let mut env = vec![0.0; n];
+
+
+    for i in 0..n {
+        env[i] = if attack_n > 0 && i < attack_n {
+            i as f32 / attack_n as f32
+        } else if decay_n > 0 && i < sustain_start {
+            let t = (i - attack_n) as f32 / decay_n as f32;
+            1.0 + (sustain_level - 1.0) * t
+        } else if i < release_start {
+            sustain_level
+        } else if release_n > 0 {
+            let t = (i - release_start) as f32 / release_n as f32;
+            sustain_level * (1.0 - t).max(0.0)
+        } else {
+            0.0
+        };
+    }
+
+
+    env
+}
+
+
+/// Petit générateur de bruit pseudo-aléatoire.
+/// Pratique pour snare et hi-hat.
+fn noise_vec(n: usize, seed: u32) -> Vec<f32> {
+    let mut state = seed;
+    let mut out = Vec::with_capacity(n);
+
+
+    for _ in 0..n {
+        state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+        let v = ((state >> 8) as f32 / ((u32::MAX >> 8) as f32)) * 2.0 - 1.0;
+        out.push(v);
+    }
+
+
+    out
+}
+
+
+/// ---------------------------------------------------------------------------
+/// SYNTHÉS DE NOTES
+/// ---------------------------------------------------------------------------
+
+
+/// Note de basse:
+/// - square-ish pour le corps
+/// - sinus à l'octave du dessous pour le sub
+/// - enveloppe courte
+/// - léger low-pass
+/// - saturation
+fn render_bass_note(midi: i32, beats: f32, bpm: f32, sample_rate: usize, device: &Device) -> Vec<f32> {
+    let seconds = beats_to_seconds(beats, bpm);
+    let n = (seconds * sample_rate as f32) as usize;
+    let freq = midi_to_hz(midi);
+
+
+    let osc_main = squareish_wave(freq, seconds, sample_rate, device).mul_scalar(0.75);
+    let osc_sub = sine_wave(freq / 2.0, seconds, sample_rate, device).mul_scalar(0.45);
+
+
+    let env = adsr_envelope(n, sample_rate, 0.003, 0.08, 0.55, 0.08);
+    let env_t = tensor_from_samples(&env, device);
+
+
+    let x = (osc_main + osc_sub) * env_t;
+    let x = low_pass_moving_average(x, 4);
+    let x = soft_clip_tanh(x, 1.8);
+    let x = normalize_peak_mono(x, 0.85);
+
+
+    tensor_to_samples(x)
+}
+
+
+/// Note de pad:
+/// - double saw détunée
+/// - enveloppe lente
+/// - filtre doux
+/// - saturation légère
+fn render_pad_note(midi: i32, beats: f32, bpm: f32, sample_rate: usize, device: &Device) -> Vec<f32> {
+    let seconds = beats_to_seconds(beats, bpm);
+    let n = (seconds * sample_rate as f32) as usize;
+    let freq = midi_to_hz(midi);
+
+
+    let saw_a = saw_wave(freq * 0.997, seconds, sample_rate, device).mul_scalar(0.50);
+    let saw_b = saw_wave(freq * 1.003, seconds, sample_rate, device).mul_scalar(0.50);
+    let body = sine_wave(freq / 2.0, seconds, sample_rate, device).mul_scalar(0.20);
+
+
+    let env = adsr_envelope(n, sample_rate, 0.25, 0.40, 0.75, 0.80);
+    let env_t = tensor_from_samples(&env, device);
+
+
+    let x = (saw_a + saw_b + body) * env_t;
+    let x = low_pass_moving_average(x, 8);
+    let x = soft_clip_tanh(x, 1.3);
+    let x = normalize_peak_mono(x, 0.75);
+
+
+    tensor_to_samples(x)
+}
+
+
+/// Note de lead:
+/// - saw pour le mordant
+/// - sinus pour arrondir
+/// - enveloppe plus nerveuse
+/// - saturation un peu plus forte
+fn render_lead_note(midi: i32, beats: f32, bpm: f32, sample_rate: usize, device: &Device) -> Vec<f32> {
+    let seconds = beats_to_seconds(beats, bpm);
+    let n = (seconds * sample_rate as f32) as usize;
+    let freq = midi_to_hz(midi);
+
+
+    let saw = saw_wave(freq, seconds, sample_rate, device).mul_scalar(0.70);
+    let sine = sine_wave(freq, seconds, sample_rate, device).mul_scalar(0.25);
+    let air = sine_wave(freq * 2.0, seconds, sample_rate, device).mul_scalar(0.10);
+
+
+    let env = adsr_envelope(n, sample_rate, 0.005, 0.06, 0.55, 0.12);
+    let env_t = tensor_from_samples(&env, device);
+
+
+    let x = (saw + sine + air) * env_t;
+    let x = low_pass_moving_average(x, 2);
+    let x = soft_clip_tanh(x, 2.0);
+    let x = normalize_peak_mono(x, 0.80);
+
+
+    tensor_to_samples(x)
+}
+
+
+/// Kick synthétique:
+/// - fréquence qui descend vite
+/// - enveloppe courte
+/// - petit click d'attaque
+fn render_kick(sample_rate: usize, device: &Device) -> Vec<f32> {
+    let seconds = 0.50;
+    let n = (seconds * sample_rate as f32) as usize;
+
+
+    let mut out = vec![0.0; n];
+    let mut phase = 0.0f32;
+
+
+    for i in 0..n {
+        let t = i as f32 / sample_rate as f32;
+        let x = i as f32 / n as f32;
+
+
+        let freq = 150.0 - 110.0 * x.powf(0.35);
+        phase += 2.0 * PI * freq / sample_rate as f32;
+
+
+        let amp = (1.0 - x).powf(4.0);
+
+
+        let click = if t < 0.008 {
+            (1.0 - t / 0.008).powf(5.0) * 0.25
+        } else {
+            0.0
+        };
+
+
+        out[i] = phase.sin() * amp + click;
+    }
+
+
+    let x = tensor_from_samples(&out, device);
+    let x = soft_clip_tanh(x, 1.6);
+    let x = normalize_peak_mono(x, 0.95);
+
+
+    tensor_to_samples(x)
+}
+
+
+/// Snare:
+/// - bruit bright
+/// - un petit fond tonal
+/// - enveloppe rapide
+fn render_snare(sample_rate: usize, device: &Device) -> Vec<f32> {
+    let seconds = 0.28;
+    let n = (seconds * sample_rate as f32) as usize;
+
+
+    let noise = noise_vec(n, 0x12345678);
+    let noise_t = tensor_from_samples(&noise, device);
+    let bright = high_pass_from_lowpass(noise_t, 20).mul_scalar(0.95);
+
+
+    let tone = sine_wave(180.0, seconds, sample_rate, device).mul_scalar(0.20);
+
+
+    let env = adsr_envelope(n, sample_rate, 0.001, 0.05, 0.18, 0.10);
+    let env_t = tensor_from_samples(&env, device);
+
+
+    let x = (bright + tone) * env_t;
+    let x = soft_clip_tanh(x, 1.5);
+    let x = normalize_peak_mono(x, 0.80);
+
+
+    tensor_to_samples(x)
+}
+
+
+/// Hi-hat:
+/// - bruit très aigu
+/// - enveloppe ultra courte
+fn render_hat(sample_rate: usize, device: &Device, seed: u32) -> Vec<f32> {
+    let seconds = 0.08;
+    let n = (seconds * sample_rate as f32) as usize;
+
+
+    let noise = noise_vec(n, seed);
+    let noise_t = tensor_from_samples(&noise, device);
+    let bright = high_pass_from_lowpass(noise_t, 8);
+
+
+    let env = adsr_envelope(n, sample_rate, 0.0005, 0.01, 0.08, 0.03);
+    let env_t = tensor_from_samples(&env, device);
+
+
+    let x = bright * env_t;
+    let x = soft_clip_tanh(x, 1.2);
+    let x = normalize_peak_mono(x, 0.40);
+
+
+    tensor_to_samples(x)
+}
+
+
+/// ---------------------------------------------------------------------------
+/// MIX / STÉRÉO
+/// ---------------------------------------------------------------------------
+
+
+fn pan_gains(pan: f32) -> (f32, f32) {
+    let p = pan.clamp(-1.0, 1.0);
+    let angle = (p + 1.0) * PI * 0.25;
+    (angle.cos(), angle.sin())
+}
+
+
+/// Ajoute un clip mono dans une piste stéréo à une position donnée.
+/// `pan = -1` => gauche, `pan = +1` => droite.
+fn add_clip_stereo(
+    left: &mut [f32],
+    right: &mut [f32],
+    start_sample: usize,
+    clip: &[f32],
+    gain: f32,
+    pan: f32,
+) {
+    let (gl, gr) = pan_gains(pan);
+
+
+    for (i, &x) in clip.iter().enumerate() {
+        let pos = start_sample + i;
+        if pos >= left.len() {
+            break;
+        }
+
+
+        left[pos] += x * gain * gl;
+        right[pos] += x * gain * gr;
+    }
+}
+
+
+/// Delay ping-pong très simple sur une piste stéréo.
+/// On prend le centre et on envoie les répétitions alternativement
+/// à gauche puis à droite.
+fn ping_pong_delay(
+    left: &[f32],
+    right: &[f32],
+    sample_rate: usize,
+    delay_ms: usize,
+    taps: usize,
+    decay: f32,
+    send: f32,
+) -> (Vec<f32>, Vec<f32>) {
+    let n = left.len();
+    let mut out_l = left.to_vec();
+    let mut out_r = right.to_vec();
+
+
+    let center: Vec<f32> = left
+        .iter()
+        .zip(right.iter())
+        .map(|(l, r)| (l + r) * 0.5 * send)
+        .collect();
+
+
+    let delay = sample_rate * delay_ms / 1000;
+
+
+    for tap in 1..=taps {
+        let shift = tap * delay;
+        let gain = decay.powi(tap as i32);
+
+
+        for i in 0..n {
+            let dst = i + shift;
+            if dst >= n {
+                break;
+            }
+
+
+            let x = center[i] * gain;
+
+
+            if tap % 2 == 1 {
+                out_l[dst] += x;
+            } else {
+                out_r[dst] += x;
+            }
+        }
+    }
+
+
+    (out_l, out_r)
+}
+
+
+/// Master final:
+/// - saturation légère
+/// - un tout petit adoucissement
+/// - normalisation
+fn master_stereo(left: Vec<f32>, right: Vec<f32>, device: &Device) -> (Vec<f32>, Vec<f32>) {
+    let l = tensor_from_samples(&left, device);
+    let r = tensor_from_samples(&right, device);
+
+
+    let l = soft_clip_tanh(l, 1.25);
+    let r = soft_clip_tanh(r, 1.25);
+
+
+    let l = low_pass_moving_average(l, 1);
+    let r = low_pass_moving_average(r, 1);
+
+
+    let l_peak = l.clone().abs().max().into_scalar();
+    let r_peak = r.clone().abs().max().into_scalar();
+    let peak = l_peak.max(r_peak).max(1e-6);
+
+
+    let l = l.div_scalar(peak).mul_scalar(0.95);
+    let r = r.div_scalar(peak).mul_scalar(0.95);
+
+
+    (tensor_to_samples(l), tensor_to_samples(r))
+}
+
+
+/// ---------------------------------------------------------------------------
+/// EXPORT WAV
+/// ---------------------------------------------------------------------------
+
+
+fn write_wav_stereo_f32(
+    path: &str,
+    left: &[f32],
+    right: &[f32],
+    sample_rate: u32,
+) -> Result<(), Box<dyn Error>> {
+    if left.len() != right.len() {
+        return Err("Les deux canaux n'ont pas la même taille.".into());
+    }
+
+
+    let spec = hound::WavSpec {
+        channels: 2,
+        sample_rate,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+
+
+    let mut writer = hound::WavWriter::create(path, spec)?;
+
+
+    for i in 0..left.len() {
+        let l = left[i].clamp(-1.0, 1.0);
+        let r = right[i].clamp(-1.0, 1.0);
+
+
+        writer.write_sample((l * i16::MAX as f32) as i16)?;
+        writer.write_sample((r * i16::MAX as f32) as i16)?;
+    }
+
+
+    writer.finalize()?;
+    Ok(())
+}
+
+
+/// ---------------------------------------------------------------------------
+/// GÉNÉRATION DU MORCEAU
+/// ---------------------------------------------------------------------------
+
+
+fn main() -> Result<(), Box<dyn Error>> {
+    let device = Device::default();
+
+
+    // -----------------------------------------------------------------------
+    // PARAMÈTRES GLOBAUX
+    // -----------------------------------------------------------------------
+    let sample_rate = 44_100usize;
+    let bpm = 100.0;
+    let bars = 8usize;
+
+
+    // On ajoute un peu de marge à la fin pour laisser respirer le delay.
+    let total_beats = bars as f32 * 4.0 + 4.0;
+    let total_samples = beat_to_sample(total_beats, bpm, sample_rate);
+
+
+    // Stems séparés pour construire le morceau proprement.
+    let mut drums_l = vec![0.0f32; total_samples];
+    let mut drums_r = vec![0.0f32; total_samples];
+
+
+    let mut bass_l = vec![0.0f32; total_samples];
+    let mut bass_r = vec![0.0f32; total_samples];
+
+
+    let mut pad_l = vec![0.0f32; total_samples];
+    let mut pad_r = vec![0.0f32; total_samples];
+
+
+    let mut lead_l = vec![0.0f32; total_samples];
+    let mut lead_r = vec![0.0f32; total_samples];
+
+
+    // -----------------------------------------------------------------------
+    // SONS DE BATTERIE
+    // -----------------------------------------------------------------------
+    let kick = render_kick(sample_rate, &device);
+    let snare = render_snare(sample_rate, &device);
+
+
+    // -----------------------------------------------------------------------
+    // HARMONIE
+    // -----------------------------------------------------------------------
+    // Progression ultra classique qui sonne immédiatement "musique":
+    // Am - F - C - G
+    //
+    // Chaque entrée:
+    // - accord pad
+    // - racine de basse
+    let progression: [([i32; 3], i32); 4] = [
+        ([57, 60, 64], 33), // A minor : A3 C4 E4 / basse A1
+        ([53, 57, 60], 29), // F major : F3 A3 C4 / basse F1
+        ([60, 64, 67], 36), // C major : C4 E4 G4 / basse C2
+        ([55, 59, 62], 31), // G major : G3 B3 D4 / basse G1
+    ];
+
+
+    // -----------------------------------------------------------------------
+    // PAD + BASSE
+    // -----------------------------------------------------------------------
+    for bar in 0..bars {
+        let (chord, bass_root) = progression[bar % progression.len()];
+        let bar_start_beat = bar as f32 * 4.0;
+
+
+        // --- PAD ---
+        // On place les 3 notes de l'accord dans le champ stéréo.
+        // Gauche / centre / droite.
+        for (note_index, midi) in chord.iter().enumerate() {
+            let pan = match note_index {
+                0 => -0.45,
+                1 => 0.0,
+                _ => 0.45,
+            };
+
+
+            // L'accord tient tout le bar.
+            let clip = render_pad_note(*midi, 4.0, bpm, sample_rate, &device);
+            let start = beat_to_sample(bar_start_beat, bpm, sample_rate);
+            add_clip_stereo(&mut pad_l, &mut pad_r, start, &clip, 0.28, pan);
+        }
+
+
+        // --- BASSE ---
+        // Pattern simple mais efficace:
+        // racine, racine, octave, quinte
+        let bass_pattern = [bass_root, bass_root, bass_root + 12, bass_root + 7];
+
+
+        for step in 0..4 {
+            let clip = render_bass_note(bass_pattern[step], 0.85, bpm, sample_rate, &device);
+            let start = beat_to_sample(bar_start_beat + step as f32, bpm, sample_rate);
+            add_clip_stereo(&mut bass_l, &mut bass_r, start, &clip, 0.32, 0.0);
+        }
+    }
+
+
+    // -----------------------------------------------------------------------
+    // BATTERIE
+    // -----------------------------------------------------------------------
+    for bar in 0..bars {
+        let base = bar as f32 * 4.0;
+
+
+        // Kick en four-on-the-floor:
+        // une grosse caisse sur chaque temps.
+        for beat in [0.0, 1.0, 2.0, 3.0] {
+            let start = beat_to_sample(base + beat, bpm, sample_rate);
+            add_clip_stereo(&mut drums_l, &mut drums_r, start, &kick, 0.55, 0.0);
+        }
+
+
+        // Snare sur 2 et 4.
+        for beat in [1.0, 3.0] {
+            let start = beat_to_sample(base + beat, bpm, sample_rate);
+            add_clip_stereo(&mut drums_l, &mut drums_r, start, &snare, 0.48, 0.0);
+        }
+
+
+        // Hi-hat sur tous les contretemps (croches).
+        for step in 0..8 {
+            let beat = base + step as f32 * 0.5;
+
+
+            let hat = render_hat(sample_rate, &device, 0xABCDEF00u32.wrapping_add((bar * 8 + step) as u32));
+
+
+            // Légère alternance gauche/droite pour donner du mouvement.
+            let pan = if step % 2 == 0 { -0.15 } else { 0.15 };
+
+
+            let start = beat_to_sample(beat, bpm, sample_rate);
+            add_clip_stereo(&mut drums_l, &mut drums_r, start, &hat, 0.22, pan);
+        }
+    }
+
+
+    // -----------------------------------------------------------------------
+    // LEAD MÉLODIQUE
+    // -----------------------------------------------------------------------
+    // On laisse respirer le morceau:
+    // la mélodie n'entre qu'à partir de la mesure 5.
+    //
+    // Motifs simples en A mineur.
+    let motif_a: &[(f32, i32, f32)] = &[
+        (0.0, 69, 0.5),  // A4
+        (0.5, 72, 0.5),  // C5
+        (1.0, 76, 0.75), // E5
+        (2.0, 74, 0.5),  // D5
+        (2.5, 72, 0.5),  // C5
+        (3.0, 69, 0.75), // A4
+    ];
+
+
+    let motif_b: &[(f32, i32, f32)] = &[
+        (0.0, 72, 0.5),  // C5
+        (0.5, 74, 0.5),  // D5
+        (1.0, 76, 0.5),  // E5
+        (1.5, 79, 0.75), // G5
+        (2.5, 76, 0.5),  // E5
+        (3.0, 74, 0.75), // D5
+    ];
+
+
+    for bar in 4..bars {
+        let bar_start = bar as f32 * 4.0;
+        let motif = if bar % 2 == 0 { motif_a } else { motif_b };
+
+
+        for &(offset, midi, dur) in motif.iter() {
+            let clip = render_lead_note(midi, dur, bpm, sample_rate, &device);
+            let start = beat_to_sample(bar_start + offset, bpm, sample_rate);
+
+
+            // Lead légèrement à droite.
+            add_clip_stereo(&mut lead_l, &mut lead_r, start, &clip, 0.26, 0.10);
+        }
+    }
+
+
+    // Delay ping-pong sur le lead pour le rendre vivant.
+    let (lead_l, lead_r) = ping_pong_delay(
+        &lead_l,
+        &lead_r,
+        sample_rate,
+        220,  // environ une croche à ce BPM
+        6,
+        0.58,
+        0.65,
+    );
+
+
+    // -----------------------------------------------------------------------
+    // MIX FINAL
+    // -----------------------------------------------------------------------
+    let mut mix_l = vec![0.0f32; total_samples];
+    let mut mix_r = vec![0.0f32; total_samples];
+
+
+    for i in 0..total_samples {
+        mix_l[i] =
+            drums_l[i] * 1.00 +
+            bass_l[i]  * 0.95 +
+            pad_l[i]   * 0.90 +
+            lead_l[i]  * 1.00;
+
+
+        mix_r[i] =
+            drums_r[i] * 1.00 +
+            bass_r[i]  * 0.95 +
+            pad_r[i]   * 0.90 +
+            lead_r[i]  * 1.00;
+    }
+
+
+    let (mix_l, mix_r) = master_stereo(mix_l, mix_r, &device);
+
+
+    write_wav_stereo_f32("music_demo.wav", &mix_l, &mix_r, sample_rate as u32)?;
+
+
+    println!("OK: music_demo.wav généré.");
+
+
+    Ok(())
+}
+```
+
+
+### Ce que ce programme fait vraiment
+
+
+Il génère un loop qui ressemble à un mini morceau :
+
+
+* **batterie** régulière,
+* **basse** qui suit les accords,
+* **pads** larges,
+* **lead** qui entre après quelques mesures,
+* **delay ping-pong** pour l’espace,
+* **master** un peu saturé pour éviter le côté trop propre.
+
+
+### Pour lancer
+
+
+```bash
+cargo run --release
+```
+
+
+Puis écoute `music_demo.wav`.
+
+
+### Trois réglages qui changent tout
+
+
+Dans `main()` :
+
+
+* `let bpm = 100.0;` pour la vitesse,
+* la `progression` pour changer l’harmonie,
+* `motif_a` et `motif_b` pour écrire une autre mélodie.
+
+
+Au prochain tour, je te fais une version encore plus musicale avec **intro, montée, refrain, outro** et **stems séparés** (`drums.wav`, `bass.wav`, `pad.wav`, `lead.wav`).
