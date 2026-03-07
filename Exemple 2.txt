@@ -1,0 +1,794 @@
+﻿Parfait — voici l’étape suivante : une version stéréo complète avec :
+* chorus gauche/droite avec LFO inversé entre les deux canaux,
+
+* delay ping-pong qui alterne les échos à gauche puis à droite,
+
+* élargissement stéréo mid/side,
+
+* une chaîne finale synthwave plus crédible que la version mono.
+
+Le code lit un input.wav mono ou stéréo.
+S’il est mono, il le duplique en stéréo automatiquement.
+Cargo.toml
+[package]
+name = "burn-audio-stereo"
+version = "0.1.0"
+edition = "2021"
+
+
+[dependencies]
+burn = "0.20.1"
+burn-ndarray = "0.20.1"
+hound = "3.5.1"
+src/main.rs
+use burn::{
+   prelude::s,
+   tensor::{Int, Tensor, TensorData},
+};
+use burn_ndarray::{NdArray, NdArrayDevice};
+use std::{error::Error, f32::consts::PI, path::Path};
+
+
+/// ---------------------------------------------------------------------------
+/// BACKEND
+/// ---------------------------------------------------------------------------
+/// Version simple et portable: CPU via ndarray.
+/// Tu peux garder toute la logique DSP identique et changer seulement
+/// le backend plus tard si tu veux passer au GPU.
+/// ---------------------------------------------------------------------------
+type B = NdArray<f32>;
+type Device = NdArrayDevice;
+
+
+/// ---------------------------------------------------------------------------
+/// STRUCTURE STÉRÉO
+/// ---------------------------------------------------------------------------
+/// On manipule la stéréo comme deux tenseurs 1D séparés:
+/// - left  = canal gauche
+/// - right = canal droit
+///
+/// C’est souvent plus simple et plus lisible que de tout empaqueter
+/// dans un seul tenseur [2, N] quand on écrit des effets audio.
+/// ---------------------------------------------------------------------------
+#[derive(Clone)]
+struct Stereo {
+   left: Tensor<B, 1>,
+   right: Tensor<B, 1>,
+}
+
+
+/// ---------------------------------------------------------------------------
+/// I/O WAV
+/// ---------------------------------------------------------------------------
+/// - Lit un WAV PCM 16-bit mono ou stéréo
+/// - Si mono: on duplique le canal vers gauche/droite
+/// - Si stéréo: on dé-entrelace
+/// ---------------------------------------------------------------------------
+fn read_wav_stereo_f32(path: &str) -> Result<(Vec<f32>, Vec<f32>, u32), Box<dyn Error>> {
+   let mut reader = hound::WavReader::open(path)?;
+   let spec = reader.spec();
+
+
+   if spec.bits_per_sample != 16 || spec.sample_format != hound::SampleFormat::Int {
+       return Err("Ce code attend un WAV PCM 16-bit.".into());
+   }
+
+
+   let raw: Vec<i16> = reader.samples::<i16>().collect::<Result<Vec<_>, _>>()?;
+
+
+   match spec.channels {
+       1 => {
+           let mono: Vec<f32> = raw
+               .into_iter()
+               .map(|v| v as f32 / i16::MAX as f32)
+               .collect();
+
+
+           // On duplique le mono en stéréo.
+           Ok((mono.clone(), mono, spec.sample_rate))
+       }
+       2 => {
+           if raw.len() % 2 != 0 {
+               return Err("Flux stéréo invalide.".into());
+           }
+
+
+           let mut left = Vec::with_capacity(raw.len() / 2);
+           let mut right = Vec::with_capacity(raw.len() / 2);
+
+
+           for frame in raw.chunks_exact(2) {
+               left.push(frame[0] as f32 / i16::MAX as f32);
+               right.push(frame[1] as f32 / i16::MAX as f32);
+           }
+
+
+           Ok((left, right, spec.sample_rate))
+       }
+       _ => Err("Ce code de démo accepte uniquement mono ou stéréo.".into()),
+   }
+}
+
+
+/// Écrit un WAV stéréo PCM 16-bit à partir de deux canaux normalisés [-1, 1].
+fn write_wav_stereo_f32(
+   path: &str,
+   left: &[f32],
+   right: &[f32],
+   sample_rate: u32,
+) -> Result<(), Box<dyn Error>> {
+   if left.len() != right.len() {
+       return Err("Les canaux gauche/droite n'ont pas la même longueur.".into());
+   }
+
+
+   let spec = hound::WavSpec {
+       channels: 2,
+       sample_rate,
+       bits_per_sample: 16,
+       sample_format: hound::SampleFormat::Int,
+   };
+
+
+   let mut writer = hound::WavWriter::create(path, spec)?;
+
+
+   for i in 0..left.len() {
+       let l = left[i].clamp(-1.0, 1.0);
+       let r = right[i].clamp(-1.0, 1.0);
+
+
+       writer.write_sample((l * i16::MAX as f32) as i16)?;
+       writer.write_sample((r * i16::MAX as f32) as i16)?;
+   }
+
+
+   writer.finalize()?;
+   Ok(())
+}
+
+
+/// ---------------------------------------------------------------------------
+/// CONVERSIONS Vec <-> Tensor
+/// ---------------------------------------------------------------------------
+fn tensor_from_samples(samples: &[f32], device: &Device) -> Tensor<B, 1> {
+   Tensor::<B, 1>::from_data(TensorData::new(samples.to_vec(), [samples.len()]), device)
+}
+
+
+fn tensor_to_samples(x: Tensor<B, 1>) -> Vec<f32> {
+   x.into_data().to_vec::<f32>().unwrap()
+}
+
+
+fn stereo_from_vecs(left: &[f32], right: &[f32], device: &Device) -> Stereo {
+   Stereo {
+       left: tensor_from_samples(left, device),
+       right: tensor_from_samples(right, device),
+   }
+}
+
+
+/// ---------------------------------------------------------------------------
+/// OUTILS GÉNÉRAUX
+/// ---------------------------------------------------------------------------
+
+
+/// Crée un axe temporel t = [0, 1/sr, 2/sr, ...].
+fn time_axis(n: usize, sample_rate: usize, device: &Device) -> Tensor<B, 1> {
+   Tensor::<B, 1, Int>::arange(0..n as i64, device)
+       .float()
+       .div_scalar(sample_rate as f32)
+}
+
+
+/// Génère une sinusoïde.
+fn sine_wave(freq_hz: f32, seconds: f32, sample_rate: usize, device: &Device) -> Tensor<B, 1> {
+   let n = (seconds * sample_rate as f32) as usize;
+   let t = time_axis(n, sample_rate, device);
+   t.mul_scalar(2.0 * PI * freq_hz).sin()
+}
+
+
+/// Décalage à droite avec zéro-padding.
+/// Très utile pour fabriquer des delays.
+fn shift_right_zero(x: Tensor<B, 1>, shift: usize) -> Tensor<B, 1> {
+   let n = x.dims()[0];
+   let device = x.device();
+
+
+   if shift == 0 {
+       return x;
+   }
+   if shift >= n {
+       return Tensor::<B, 1>::zeros([n], &device);
+   }
+
+
+   let core = x.slice(s![..(n - shift)]);
+   let mut out = Tensor::<B, 1>::zeros([n], &device);
+   out = out.slice_assign(s![(shift)..], core);
+   out
+}
+
+
+/// Décalage à gauche avec zéro-padding.
+fn shift_left_zero(x: Tensor<B, 1>, shift: usize) -> Tensor<B, 1> {
+   let n = x.dims()[0];
+   let device = x.device();
+
+
+   if shift == 0 {
+       return x;
+   }
+   if shift >= n {
+       return Tensor::<B, 1>::zeros([n], &device);
+   }
+
+
+   let core = x.slice(s![(shift)..]);
+   let mut out = Tensor::<B, 1>::zeros([n], &device);
+   out = out.slice_assign(s![..(n - shift)], core);
+   out
+}
+
+
+/// Mélange dry/wet pour un signal mono.
+fn mix_mono(dry: Tensor<B, 1>, wet: Tensor<B, 1>, wet_amount: f32) -> Tensor<B, 1> {
+   dry.clone().mul_scalar(1.0 - wet_amount) + wet.mul_scalar(wet_amount)
+}
+
+
+/// Normalisation mono selon le pic.
+fn normalize_peak_mono(x: Tensor<B, 1>, target_peak: f32) -> Tensor<B, 1> {
+   let peak = x.clone().abs().max().into_scalar();
+
+
+   if peak < 1e-8 {
+       x
+   } else {
+       x.div_scalar(peak).mul_scalar(target_peak)
+   }
+}
+
+
+/// Normalisation stéréo: on prend le plus grand pic des deux canaux.
+fn normalize_peak_stereo(x: Stereo, target_peak: f32) -> Stereo {
+   let peak_l = x.left.clone().abs().max().into_scalar();
+   let peak_r = x.right.clone().abs().max().into_scalar();
+   let peak = peak_l.max(peak_r);
+
+
+   if peak < 1e-8 {
+       x
+   } else {
+       Stereo {
+           left: x.left.div_scalar(peak).mul_scalar(target_peak),
+           right: x.right.div_scalar(peak).mul_scalar(target_peak),
+       }
+   }
+}
+
+
+/// Somme vers mono "centre".
+fn stereo_to_mono_center(x: &Stereo) -> Tensor<B, 1> {
+   (x.left.clone() + x.right.clone()).mul_scalar(0.5)
+}
+
+
+/// Duplique un mono vers stéréo.
+fn mono_to_stereo(x: Tensor<B, 1>) -> Stereo {
+   Stereo {
+       left: x.clone(),
+       right: x,
+   }
+}
+
+
+/// ---------------------------------------------------------------------------
+/// BRIQUES MONO
+/// ---------------------------------------------------------------------------
+
+
+fn gain(x: Tensor<B, 1>, amount: f32) -> Tensor<B, 1> {
+   x.mul_scalar(amount)
+}
+
+
+fn hard_clip(x: Tensor<B, 1>, threshold: f32) -> Tensor<B, 1> {
+   x.clamp_min(-threshold)
+       .clamp_max(threshold)
+       .div_scalar(threshold)
+}
+
+
+fn soft_clip_tanh(x: Tensor<B, 1>, drive: f32) -> Tensor<B, 1> {
+   x.mul_scalar(drive).tanh()
+}
+
+
+/// Filtre low-pass très simple:
+/// moyenne glissante symétrique.
+fn low_pass_moving_average(x: Tensor<B, 1>, radius: usize) -> Tensor<B, 1> {
+   let n = x.dims()[0];
+   let device = x.device();
+
+
+   let mut acc = Tensor::<B, 1>::zeros([n], &device);
+   let mut taps = 0usize;
+
+
+   // Centre
+   acc = acc + x.clone();
+   taps += 1;
+
+
+   // Voisins
+   for k in 1..=radius {
+       acc = acc + shift_right_zero(x.clone(), k);
+       acc = acc + shift_left_zero(x.clone(), k);
+       taps += 2;
+   }
+
+
+   acc.div_scalar(taps as f32)
+}
+
+
+fn high_pass_from_lowpass(x: Tensor<B, 1>, radius: usize) -> Tensor<B, 1> {
+   let low = low_pass_moving_average(x.clone(), radius);
+   x - low
+}
+
+
+/// Tremolo / pump au tempo.
+fn pump_mono(x: Tensor<B, 1>, sample_rate: usize, bpm: f32, depth: f32) -> Tensor<B, 1> {
+   let n = x.dims()[0];
+   let device = x.device();
+
+
+   let beats_hz = bpm / 60.0;
+   let t = time_axis(n, sample_rate, &device);
+
+
+   let lfo = t
+       .mul_scalar(2.0 * PI * beats_hz)
+       .sin()
+       .add_scalar(1.0)
+       .div_scalar(2.0);
+
+
+   // On accentue le creux pour rappeler un sidechain pumping.
+   let duck = lfo.clone() * lfo;
+   let gain = Tensor::<B, 1>::ones([n], &device) - duck.mul_scalar(depth);
+
+
+   x * gain
+}
+
+
+/// ---------------------------------------------------------------------------
+/// BRIQUES STÉRÉO
+/// ---------------------------------------------------------------------------
+
+
+fn gain_stereo(x: Stereo, amount: f32) -> Stereo {
+   Stereo {
+       left: gain(x.left, amount),
+       right: gain(x.right, amount),
+   }
+}
+
+
+fn soft_clip_stereo(x: Stereo, drive: f32) -> Stereo {
+   Stereo {
+       left: soft_clip_tanh(x.left, drive),
+       right: soft_clip_tanh(x.right, drive),
+   }
+}
+
+
+fn hard_clip_stereo(x: Stereo, threshold: f32) -> Stereo {
+   Stereo {
+       left: hard_clip(x.left, threshold),
+       right: hard_clip(x.right, threshold),
+   }
+}
+
+
+/// Traitement "tonal" par canal:
+/// - corps = low-pass
+/// - shimmer = high-pass léger
+///
+/// L’idée n’est pas de faire un EQ parfait, mais de donner un caractère
+/// plus rétro / synthétique.
+fn tone_shape_mono(x: Tensor<B, 1>) -> Tensor<B, 1> {
+   let body = low_pass_moving_average(x.clone(), 6).mul_scalar(0.90);
+   let shimmer = high_pass_from_lowpass(x.clone(), 28).mul_scalar(0.30);
+   normalize_peak_mono(body + shimmer, 0.95)
+}
+
+
+fn tone_shape_stereo(x: Stereo) -> Stereo {
+   Stereo {
+       left: tone_shape_mono(x.left),
+       right: tone_shape_mono(x.right),
+   }
+}
+
+
+/// Mid/Side widening:
+/// - mid  = centre commun
+/// - side = différence gauche/droite
+///
+/// Si on amplifie "side", on élargit l’image stéréo.
+fn widen_stereo(x: Stereo, side_gain: f32) -> Stereo {
+   let mid = (x.left.clone() + x.right.clone()).mul_scalar(0.5);
+   let side = (x.left.clone() - x.right.clone())
+       .mul_scalar(0.5)
+       .mul_scalar(side_gain);
+
+
+   Stereo {
+       left: mid.clone() + side.clone(),
+       right: mid - side,
+   }
+}
+
+
+/// Pump appliqué de façon identique aux deux canaux.
+fn pump_stereo(x: Stereo, sample_rate: usize, bpm: f32, depth: f32) -> Stereo {
+   Stereo {
+       left: pump_mono(x.left, sample_rate, bpm, depth),
+       right: pump_mono(x.right, sample_rate, bpm, depth),
+   }
+}
+
+
+/// ---------------------------------------------------------------------------
+/// CHORUS STÉRÉO G/D
+/// ---------------------------------------------------------------------------
+/// Ici on fait un pseudo-chorus modulaire simple:
+/// - deux micro-delays différents par canal
+/// - un LFO lent qui mélange ces deux delays
+/// - LFO en opposition de phase entre gauche et droite
+///
+/// Résultat:
+/// - ça bouge,
+/// - ça élargit l’image,
+/// - ça donne tout de suite un côté plus rétro / synthwave.
+///
+/// Ce n’est pas un "vrai" delay fractionnaire de studio, mais c’est une
+/// excellente base pédagogique.
+/// ---------------------------------------------------------------------------
+fn stereo_chorus_lr(
+   x: Stereo,
+   sample_rate: usize,
+   lfo_hz: f32,
+   wet_amount: f32,
+) -> Stereo {
+   let n = x.left.dims()[0];
+   let device = x.left.device();
+
+
+   let t = time_axis(n, sample_rate, &device);
+
+
+   // LFO de base: sinusoïde entre -1 et 1.
+   let base = t.mul_scalar(2.0 * PI * lfo_hz).sin();
+
+
+   // LFO gauche entre 0 et 1.
+   let lfo_l = base.clone().add_scalar(1.0).div_scalar(2.0);
+
+
+   // LFO droite en opposition de phase.
+   let lfo_r = base.mul_scalar(-1.0).add_scalar(1.0).div_scalar(2.0);
+
+
+   // 1 - lfo
+   let inv_lfo_l = lfo_l.clone().mul_scalar(-1.0).add_scalar(1.0);
+   let inv_lfo_r = lfo_r.clone().mul_scalar(-1.0).add_scalar(1.0);
+
+
+   // Délais très courts (en millisecondes) pour créer l’effet chorus.
+   let d1_l = (0.012 * sample_rate as f32) as usize; // 12 ms
+   let d2_l = (0.021 * sample_rate as f32) as usize; // 21 ms
+   let d1_r = (0.014 * sample_rate as f32) as usize; // 14 ms
+   let d2_r = (0.024 * sample_rate as f32) as usize; // 24 ms
+
+
+   // Copies retardées du canal gauche.
+   let left_short = shift_right_zero(x.left.clone(), d1_l);
+   let left_long = shift_right_zero(x.left.clone(), d2_l);
+
+
+   // Copies retardées du canal droit.
+   let right_short = shift_right_zero(x.right.clone(), d1_r);
+   let right_long = shift_right_zero(x.right.clone(), d2_r);
+
+
+   // Un petit crossfeed accentue encore la largeur.
+   let cross_l = shift_right_zero(x.right.clone(), (0.017 * sample_rate as f32) as usize)
+       .mul_scalar(0.12);
+   let cross_r = shift_right_zero(x.left.clone(), (0.019 * sample_rate as f32) as usize)
+       .mul_scalar(0.12);
+
+
+   // Wet gauche:
+   // on mélange delay court et delay long selon le LFO.
+   let wet_l =
+       left_short * lfo_l + left_long * inv_lfo_l + cross_l;
+
+
+   // Wet droite:
+   // même principe, mais LFO opposé.
+   let wet_r =
+       right_short * lfo_r + right_long * inv_lfo_r + cross_r;
+
+
+   normalize_peak_stereo(
+       Stereo {
+           left: mix_mono(x.left, wet_l, wet_amount),
+           right: mix_mono(x.right, wet_r, wet_amount),
+       },
+       0.95,
+   )
+}
+
+
+/// ---------------------------------------------------------------------------
+/// DELAY PING-PONG
+/// ---------------------------------------------------------------------------
+/// Idée:
+/// - on prend le centre du signal
+/// - on crée plusieurs copies retardées
+/// - les taps impairs vont à gauche
+/// - les taps pairs vont à droite
+///
+/// Résultat:
+/// l’écho "rebondit" d’un côté à l’autre.
+/// ---------------------------------------------------------------------------
+fn ping_pong_delay(
+   x: Stereo,
+   sample_rate: usize,
+   delay_ms: usize,
+   taps: usize,
+   decay: f32,
+   wet_amount: f32,
+) -> Stereo {
+   let n = x.left.dims()[0];
+   let device = x.left.device();
+
+
+   let mono_center = stereo_to_mono_center(&x);
+   let base_delay = sample_rate * delay_ms / 1000;
+
+
+   let mut wet_l = Tensor::<B, 1>::zeros([n], &device);
+   let mut wet_r = Tensor::<B, 1>::zeros([n], &device);
+
+
+   for tap in 1..=taps {
+       let delayed = shift_right_zero(mono_center.clone(), tap * base_delay)
+           .mul_scalar(decay.powi(tap as i32));
+
+
+       if tap % 2 == 1 {
+           // Tap impair -> gauche
+           wet_l = wet_l + delayed;
+       } else {
+           // Tap pair -> droite
+           wet_r = wet_r + delayed;
+       }
+   }
+
+
+   normalize_peak_stereo(
+       Stereo {
+           left: mix_mono(x.left, wet_l, wet_amount),
+           right: mix_mono(x.right, wet_r, wet_amount),
+       },
+       0.95,
+   )
+}
+
+
+/// ---------------------------------------------------------------------------
+/// CHAÎNE FINALE "SYNTHWAVE STÉRÉO"
+/// ---------------------------------------------------------------------------
+/// Étapes:
+/// 1. drive/saturation
+/// 2. mise en forme tonale
+/// 3. élargissement stéréo
+/// 4. chorus L/R
+/// 5. ping-pong delay
+/// 6. pump au tempo
+/// 7. légère saturation de sortie
+///
+/// C’est une chaîne volontairement simple, lisible et pédagogique.
+/// ---------------------------------------------------------------------------
+fn stereo_synthwaveify(x: Stereo, sample_rate: usize) -> Stereo {
+   // 1) Plus de caractère immédiatement.
+   let stage1 = normalize_peak_stereo(soft_clip_stereo(gain_stereo(x, 1.8), 1.0), 0.95);
+
+
+   // 2) Équilibre spectral plus intéressant.
+   let stage2 = tone_shape_stereo(stage1);
+
+
+   // 3) On élargit la scène stéréo.
+   let stage3 = normalize_peak_stereo(widen_stereo(stage2, 1.35), 0.95);
+
+
+   // 4) Chorus gauche/droite.
+   let stage4 = stereo_chorus_lr(stage3, sample_rate, 0.35, 0.42);
+
+
+   // 5) Ping-pong delay rétro.
+   let stage5 = ping_pong_delay(stage4, sample_rate, 220, 6, 0.58, 0.30);
+
+
+   // 6) Pump discret au tempo.
+   let stage6 = pump_stereo(stage5, sample_rate, 100.0, 0.22);
+
+
+   // 7) Finition / glue.
+   let stage7 = normalize_peak_stereo(soft_clip_stereo(stage6, 1.15), 0.95);
+
+
+   stage7
+}
+
+
+/// ---------------------------------------------------------------------------
+/// SOURCE DE DÉMO STÉRÉO
+/// ---------------------------------------------------------------------------
+/// On fabrique une source stéréo un peu large dès le départ:
+/// - centre tonal commun
+/// - un petit décalage / déséquilibre entre gauche et droite
+///
+/// Comme ça, même sans input.wav, tu peux écouter les effets.
+/// ---------------------------------------------------------------------------
+fn demo_stereo_source(sample_rate: usize, device: &Device) -> Stereo {
+   let mono = {
+       let bass = sine_wave(110.0, 5.0, sample_rate, device).mul_scalar(0.55);
+       let mid = sine_wave(220.0, 5.0, sample_rate, device).mul_scalar(0.30);
+       let high = sine_wave(880.0, 5.0, sample_rate, device).mul_scalar(0.15);
+       normalize_peak_mono(bass + mid + high, 0.90)
+   };
+
+
+   // Canal gauche: source brute.
+   let left = mono.clone();
+
+
+   // Canal droit:
+   // - léger retard
+   // - léger gain différent
+   // Cela donne déjà un peu d’espace.
+   let right = shift_right_zero(mono.clone(), (0.006 * sample_rate as f32) as usize)
+       .mul_scalar(0.96);
+
+
+   normalize_peak_stereo(Stereo { left, right }, 0.90)
+}
+
+
+fn main() -> Result<(), Box<dyn Error>> {
+   let device = Device::default();
+   let sample_rate = 44_100usize;
+
+
+   // -----------------------------------------------------------------------
+   // DÉMO SYNTHÉTIQUE
+   // -----------------------------------------------------------------------
+   let demo = demo_stereo_source(sample_rate, &device);
+
+
+   write_wav_stereo_f32(
+       "00_demo_stereo_source.wav",
+       &tensor_to_samples(demo.left.clone()),
+       &tensor_to_samples(demo.right.clone()),
+       sample_rate as u32,
+   )?;
+
+
+   let demo_chorus = stereo_chorus_lr(demo.clone(), sample_rate, 0.35, 0.45);
+   write_wav_stereo_f32(
+       "01_demo_stereo_chorus.wav",
+       &tensor_to_samples(demo_chorus.left.clone()),
+       &tensor_to_samples(demo_chorus.right.clone()),
+       sample_rate as u32,
+   )?;
+
+
+   let demo_pingpong = ping_pong_delay(demo.clone(), sample_rate, 220, 6, 0.58, 0.34);
+   write_wav_stereo_f32(
+       "02_demo_ping_pong.wav",
+       &tensor_to_samples(demo_pingpong.left.clone()),
+       &tensor_to_samples(demo_pingpong.right.clone()),
+       sample_rate as u32,
+   )?;
+
+
+   let demo_final = stereo_synthwaveify(demo, sample_rate);
+   write_wav_stereo_f32(
+       "03_demo_synthwave_stereo.wav",
+       &tensor_to_samples(demo_final.left),
+       &tensor_to_samples(demo_final.right),
+       sample_rate as u32,
+   )?;
+
+
+   // -----------------------------------------------------------------------
+   // TRAITEMENT D'UN input.wav SI PRÉSENT
+   // -----------------------------------------------------------------------
+   if Path::new("input.wav").exists() {
+       let (left, right, sr) = read_wav_stereo_f32("input.wav")?;
+       let input = stereo_from_vecs(&left, &right, &device);
+
+
+       // Étape A: juste le chorus stéréo
+       let out_chorus = stereo_chorus_lr(input.clone(), sr as usize, 0.35, 0.45);
+       write_wav_stereo_f32(
+           "10_input_stereo_chorus.wav",
+           &tensor_to_samples(out_chorus.left.clone()),
+           &tensor_to_samples(out_chorus.right.clone()),
+           sr,
+       )?;
+
+
+       // Étape B: juste le ping-pong delay
+       let out_pingpong = ping_pong_delay(input.clone(), sr as usize, 220, 6, 0.58, 0.32);
+       write_wav_stereo_f32(
+           "11_input_ping_pong.wav",
+           &tensor_to_samples(out_pingpong.left.clone()),
+           &tensor_to_samples(out_pingpong.right.clone()),
+           sr,
+       )?;
+
+
+       // Étape C: chaîne finale complète
+       let out_final = stereo_synthwaveify(input, sr as usize);
+       write_wav_stereo_f32(
+           "12_input_synthwave_stereo.wav",
+           &tensor_to_samples(out_final.left),
+           &tensor_to_samples(out_final.right),
+           sr,
+       )?;
+
+
+       println!("Traitement terminé :");
+       println!(" - 10_input_stereo_chorus.wav");
+       println!(" - 11_input_ping_pong.wav");
+       println!(" - 12_input_synthwave_stereo.wav");
+   } else {
+       println!("Pas de input.wav trouvé.");
+       println!("Les fichiers de démo ont quand même été générés.");
+   }
+
+
+   Ok(())
+}
+Ce que cette version t’apporte
+01_demo_stereo_chorus.wav te montre l’élargissement stéréo.
+02_demo_ping_pong.wav te montre les échos alternés gauche/droite.
+03_demo_synthwave_stereo.wav combine le tout dans une chaîne plus proche du brief.
+Avec un vrai input.wav, tu récupères aussi :
+   * 10_input_stereo_chorus.wav
+
+   * 11_input_ping_pong.wav
+
+   * 12_input_synthwave_stereo.wav
+
+Pour lancer
+cargo run --release
+Si tu mets un fichier input.wav dans le dossier du projet, il sera traité automatiquement.
+La vraie étape d’après, ce serait de faire une version encore plus sérieuse avec :
+      * vrai chorus à délai fractionnaire,
+
+      * filtre FIR via Conv1d de Burn,
+
+      * traitement par blocs pour viser de gros fichiers audio.
